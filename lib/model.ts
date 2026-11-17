@@ -4,7 +4,8 @@
 // The snapshot is the only input. Traded tokens are the comps: the model fits
 // log10(market cap) on log10(TVL) over the traded protocols whose TVL is
 // economically relevant, then applies that curve to the pre-token protocols,
-// adjusted by bounded growth, age and category factors. Nothing here names a
+// adjusted by a bounded growth factor and a shrunk category factor. Age was
+// tested and left out; the note at predictValue says why. Nothing here names a
 // protocol: the same functions score every row, and every number the dashboard
 // shows (fit, validation misses, bootstrap bands, farm verdicts) is computed
 // at run time from the snapshot alone.
@@ -30,12 +31,12 @@ export interface Snapshot {
   watchlist: string[];
 }
 
-export const MODEL_VERSION = 'comps-fit-1';
+export const MODEL_VERSION = 'comps-fit-2';
 
 /** Growth elasticity: fitted on the full comps it is ~0.05-0.10; the model uses 0.10. */
 export const GROWTH_ELASTICITY = 0.1;
-/** Age elasticity: fitted on the full comps it is ~0.30; the model uses 0.25. */
-export const AGE_ELASTICITY = 0.25;
+/** Category multipliers are shrunk halfway toward 1 in log space. Each one rests on the median ratio of as few as 5 comps, so the raw number overstates what a category is worth; taking its square root pulls it toward 1 without erasing it. */
+export const CAT_SHRINK = 0.5;
 /** Bootstrap refits behind every row's P10-P90 band and rank range. */
 export const BOOTSTRAP_REFITS = 200;
 /** Farm horizon, opportunity cost and the value of the farmer's time. */
@@ -132,8 +133,9 @@ const ageYrs = (p: SnapshotProtocol, fallback: number): number =>
 
 /**
  * The fitted pipeline on a training set of comps: a Huber-weighted log-log OLS
- * of market cap on TVL, plus category multipliers from the training medians.
- * The same function refits inside every validation split and bootstrap refit.
+ * of market cap on TVL, plus category multipliers from the training medians,
+ * each shrunk halfway toward 1. The same function refits inside every
+ * validation split and bootstrap refit.
  */
 export function fitPipeline(train: SnapshotProtocol[]): Fit {
   const pts = train.map((p) => ({ x: Math.log10(Math.max(1, p.tvl_usd)), y: Math.log10(Math.max(1, p.mcap_usd ?? 1)) }));
@@ -166,7 +168,7 @@ export function fitPipeline(train: SnapshotProtocol[]): Fit {
   const globalRatio = median(train.map((p) => (p.mcap_usd ?? 0) / Math.max(1, p.tvl_usd)));
   const catMult: Record<string, number> = {};
   for (const [c, ratios] of byCat) {
-    if (ratios.length >= 5) catMult[c] = round4(clip(median(ratios) / globalRatio, 0.25, 2));
+    if (ratios.length >= 5) catMult[c] = round4(Math.pow(clip(median(ratios) / globalRatio, 0.25, 2), CAT_SHRINK));
   }
   return {
     a: round4(a),
@@ -182,18 +184,25 @@ export interface Prediction {
   value: number;
   base: number;
   growthMult: number;
-  ageMult: number;
   catMult: number;
 }
 
-/** One protocol's implied value under a fit: curve x growth x age x category. */
+/**
+ * One protocol's implied value under a fit: curve x growth x category.
+ * Age is not in here. Version 1 multiplied by an age factor (elasticity 0.25),
+ * but a joint fit puts the age coefficient at about zero, and the factor cost
+ * the model 2 points on walk-forward and 4 on the blind test. The newest comps
+ * are young, yet their cap/TVL ratios run no lower than the old ones (median
+ * 0.236 against 0.246), so penalising youth mispriced exactly the cohort the
+ * blind test holds out. The age of each protocol is still shown on its row; it
+ * just does not move the value any more.
+ */
 export function predictValue(fit: Fit, p: SnapshotProtocol): Prediction {
   const base = 10 ** (fit.a + fit.b * Math.log10(Math.max(1, p.tvl_usd)));
   const growthMult = Math.exp(GROWTH_ELASTICITY * (growthLog(p, fit.medGrowthLog) - fit.medGrowthLog));
-  const ageMult = Math.exp(AGE_ELASTICITY * (Math.log(1 + ageYrs(p, fit.medAgeYrs)) - Math.log(1 + fit.medAgeYrs)));
   const catMult = fit.catMult[p.category ?? 'Other'] ?? 1;
-  const value = Math.max(1, Math.round(base * growthMult * ageMult * catMult));
-  return { value, base: Math.round(base), growthMult: round4(growthMult), ageMult: round4(ageMult), catMult: round4(catMult) };
+  const value = Math.max(1, Math.round(base * growthMult * catMult));
+  return { value, base: Math.round(base), growthMult: round4(growthMult), catMult: round4(catMult) };
 }
 
 // ---------------------------------------------------------------- validation
@@ -467,7 +476,10 @@ function depositTier(tvl: number): { deposit: number; hours: number } {
  * cheapest of the protocol's chains for 8 transactions; the reward is the
  * reference scenario (30% chance, 5% of implied value, split over F farmers
  * where F is TVL over a $10,000 average position). Net is EV minus economic
- * cost (cash + opportunity + time). The verdict is netted, not a slogan.
+ * cost (cash + opportunity + time). The verdict follows from those numbers:
+ * farm needs a positive net at the P10 value as well as at the point value,
+ * net of at least $25, and EV at least 1.5 times the economic cost; thin needs
+ * a positive net at the point value; the rest is skip.
  */
 export function farmEconomics(p: SnapshotProtocol, value: number, p10Value?: number): FarmEconomics {
   const { deposit, hours } = depositTier(p.tvl_usd);
@@ -561,7 +573,7 @@ export function farmSteps(p: SnapshotProtocol, age: number | null, econ: FarmEco
       time: `${hold} days`,
     },
     {
-      text: `Verdict: ${econ.verdict.toUpperCase()} — expected net ${econ.net_usd >= 0 ? '+' : ''}${money(econ.net_usd)} after ${money(econ.econ_cost_usd)} of economic cost over ${FARM_DAYS} days; break-even needs ${money(econ.breakeven_value_usd)} of implied value${econ.breakeven_prob_pct === null ? ', which is out of reach under the reference scenario' : `, about ${econ.breakeven_prob_pct.toFixed(0)}% distribution chance`}.`,
+      text: `Verdict: ${econ.verdict.toUpperCase()}. Expected net ${econ.net_usd >= 0 ? '+' : ''}${money(econ.net_usd)} after ${money(econ.econ_cost_usd)} of economic cost over ${FARM_DAYS} days. Break-even needs ${money(econ.breakeven_value_usd)} of implied value${econ.breakeven_prob_pct === null ? ', which is out of reach under the reference scenario' : `, about ${econ.breakeven_prob_pct.toFixed(0)}% distribution chance`}.`,
       cost: `${money(econ.econ_cost_usd)} of economic cost in all`,
       time: `${FARM_DAYS} days`,
     },
@@ -599,7 +611,7 @@ export interface BoardRow {
   rank_hi: number;
   top20_prob: number;
   farm_prob: number;
-  model: { base: number; growth_mult: number; age_mult: number; cat_mult: number };
+  model: { base: number; growth_mult: number; cat_mult: number };
   deposit_usd: number;
   chain: string;
   cash_cost_usd: number;
@@ -632,7 +644,7 @@ export interface RadarData {
     a: number;
     b: number;
     growth_elasticity: number;
-    age_elasticity: number;
+    cat_shrink: number;
     cat_mult: Record<string, number>;
     comps: number;
     excluded: { cex: number; ratio: number; nonpositive: number };
@@ -709,7 +721,7 @@ export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: Rada
         rank_hi: band.rank_hi,
         top20_prob: band.top20_prob,
         farm_prob: band.farm_prob,
-        model: { base: pred.base, growth_mult: pred.growthMult, age_mult: pred.ageMult, cat_mult: pred.catMult },
+        model: { base: pred.base, growth_mult: pred.growthMult, cat_mult: pred.catMult },
         deposit_usd: econ.deposit_usd,
         chain: econ.chain,
         cash_cost_usd: econ.cash_cost_usd,
@@ -751,7 +763,7 @@ export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: Rada
       a: fit.a,
       b: fit.b,
       growth_elasticity: GROWTH_ELASTICITY,
-      age_elasticity: AGE_ELASTICITY,
+      cat_shrink: CAT_SHRINK,
       cat_mult: fit.catMult,
       comps: comps.length,
       excluded,
