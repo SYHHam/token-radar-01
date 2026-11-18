@@ -31,7 +31,7 @@ export interface Snapshot {
   watchlist: string[];
 }
 
-export const MODEL_VERSION = 'comps-fit-2';
+export const MODEL_VERSION = 'comps-fit-3';
 
 /** Growth elasticity: fitted on the full comps it is ~0.05-0.10; the model uses 0.10. */
 export const GROWTH_ELASTICITY = 0.1;
@@ -134,8 +134,11 @@ const ageYrs = (p: SnapshotProtocol, fallback: number): number =>
 /**
  * The fitted pipeline on a training set of comps: a Huber-weighted log-log OLS
  * of market cap on TVL, plus category multipliers from the training medians,
- * each shrunk halfway toward 1. The same function refits inside every
- * validation split and bootstrap refit.
+ * each shrunk halfway toward 1. The multipliers come from log residuals after
+ * the TVL curve, not from raw cap/TVL ratios: with a TVL slope near 0.6, a
+ * raw ratio confounds what a category is worth with how big its protocols
+ * usually are. The same function refits inside every validation split and
+ * bootstrap refit.
  */
 export function fitPipeline(train: SnapshotProtocol[]): Fit {
   const pts = train.map((p) => ({ x: Math.log10(Math.max(1, p.tvl_usd)), y: Math.log10(Math.max(1, p.mcap_usd ?? 1)) }));
@@ -158,17 +161,25 @@ export function fitPipeline(train: SnapshotProtocol[]): Fit {
     const sc = Math.max(0.05, 1.4826 * (median(res) || 0.1));
     w = res.map((r) => Math.min(1, (1.345 * sc) / Math.max(1e-9, r)));
   }
-  const byCat = new Map<string, number[]>();
+  // Category multipliers from log residuals after the curve: the median
+  // residual of a category against the median residual of all comps, back
+  // in levels, clipped, then pulled halfway toward 1 in log space. A
+  // category with fewer than 5 comps gets no multiplier.
+  const residByCat = new Map<string, number[]>();
+  const allResid: number[] = [];
   for (const p of train) {
+    const r = Math.log10(Math.max(1, p.mcap_usd ?? 1)) - (a + b * Math.log10(Math.max(1, p.tvl_usd)));
+    allResid.push(r);
     const c = p.category ?? 'Other';
-    const arr = byCat.get(c) ?? [];
-    arr.push((p.mcap_usd ?? 0) / Math.max(1, p.tvl_usd));
-    byCat.set(c, arr);
+    const arr = residByCat.get(c) ?? [];
+    arr.push(r);
+    residByCat.set(c, arr);
   }
+  const globalResid = median(allResid);
   const globalRatio = median(train.map((p) => (p.mcap_usd ?? 0) / Math.max(1, p.tvl_usd)));
   const catMult: Record<string, number> = {};
-  for (const [c, ratios] of byCat) {
-    if (ratios.length >= 5) catMult[c] = round4(Math.pow(clip(median(ratios) / globalRatio, 0.25, 2), CAT_SHRINK));
+  for (const [c, rs] of residByCat) {
+    if (rs.length >= 5) catMult[c] = round4(Math.pow(clip(Math.pow(10, median(rs) - globalResid), 0.25, 2), CAT_SHRINK));
   }
   return {
     a: round4(a),
@@ -190,12 +201,14 @@ export interface Prediction {
 /**
  * One protocol's implied value under a fit: curve x growth x category.
  * Age is not in here. Version 1 multiplied by an age factor (elasticity 0.25),
- * but a joint fit puts the age coefficient at about zero, and the factor cost
- * the model 2 points on walk-forward and 4 on the blind test. The newest comps
- * are young, yet their cap/TVL ratios run no lower than the old ones (median
- * 0.236 against 0.246), so penalising youth mispriced exactly the cohort the
- * blind test holds out. The age of each protocol is still shown on its row; it
- * just does not move the value any more.
+ * but a joint fit puts the age coefficient at about zero (see
+ * jointAgeCoefficient: near 0 in log-e units on the full comps, and it swings
+ * widely across folds), and the factor cost the model 2 points on
+ * walk-forward and 4 on the blind test. The newest comps are young, yet
+ * their cap/TVL ratios run no lower than the old ones (median 0.236 against
+ * 0.246), so penalising youth mispriced exactly the cohort the blind test
+ * holds out. The age of each protocol is still shown on its row; it just
+ * does not move the value any more.
  */
 export function predictValue(fit: Fit, p: SnapshotProtocol): Prediction {
   const base = 10 ** (fit.a + fit.b * Math.log10(Math.max(1, p.tvl_usd)));
@@ -244,21 +257,31 @@ function evalSplit(train: SnapshotProtocol[], test: SnapshotProtocol[], label: s
   };
 }
 
-/** Leave-one-out, walk-forward (3 folds, pooled) and the blind newest-20% test. */
-export function validateModel(comps: SnapshotProtocol[]): { loo: TestResult; walkForward: TestResult; blind: TestResult } {
+/** Leave-one-out, walk-forward (3 folds, pooled), the blind newest-20% test, a slug-hash holdout, and the LOO 80% interval coverage. */
+export function validateModel(comps: SnapshotProtocol[]): {
+  loo: TestResult;
+  walkForward: TestResult;
+  blind: TestResult;
+  hash: TestResult;
+  looCoverage80Pct: number;
+  looPredBySlug: Map<string, number>;
+} {
   // Leave-one-out: refit without each comp, predict it, pool the errors.
   const looErrs: number[] = [];
   const looFlat: number[] = [];
   const looSigned: number[] = [];
+  const looPredBySlug = new Map<string, number>();
   for (let j = 0; j < comps.length; j++) {
     const train = comps.filter((_, i) => i !== j);
     const fit = fitPipeline(train);
     const p = comps[j]!;
     const actual = Math.max(1, p.mcap_usd ?? 1);
     const flatRatio = median(train.map((q) => (q.mcap_usd ?? 0) / Math.max(1, q.tvl_usd)));
-    looErrs.push(Math.abs(Math.log(predictValue(fit, p).value / actual)));
+    const pred = predictValue(fit, p).value;
+    looPredBySlug.set(p.slug, pred);
+    looErrs.push(Math.abs(Math.log(pred / actual)));
     looFlat.push(Math.abs(Math.log((flatRatio * p.tvl_usd) / actual)));
-    looSigned.push(Math.log(predictValue(fit, p).value / actual));
+    looSigned.push(Math.log(pred / actual));
   }
   const mean = (xs: number[]): number => xs.reduce((t, x) => t + x, 0) / Math.max(1, xs.length);
   const missOf = (errs: number[]): number[] => errs.map((e) => Math.exp(e)).sort((x, y) => x - y);
@@ -311,7 +334,214 @@ export function validateModel(comps: SnapshotProtocol[]): { loo: TestResult; wal
   // Blind: the newest 20% by listing date, never fitted on.
   const cut = Math.floor(dated.length * 0.8);
   const blind = evalSplit(dated.slice(0, cut), dated.slice(cut), 'Blind newest 20%');
-  return { loo, walkForward, blind };
+
+  // Hash holdout: a fixed fifth of comps by slug hash, never fitted on.
+  // Unlike the blind test it is not ordered by date, so it checks the model
+  // on a random-feeling split of the same snapshot.
+  const hashTrain = comps.filter((p) => fnv1a(p.slug) % 5 !== 0);
+  const hashTest = comps.filter((p) => fnv1a(p.slug) % 5 === 0);
+  const hash = evalSplit(hashTrain, hashTest, 'Hash holdout (slug hash, 20%)');
+
+  // LOO 80% interval coverage: the interval is the LOO prediction widened
+  // by 1.28 times the spread of the LOO log errors; the number is the share
+  // of comps whose actual cap falls inside it. A nominal 80% interval that
+  // covers near 80% is calibrated; far below means the bands are too tight.
+  const looSigma = Math.sqrt(looSigned.reduce((t, s) => t + s * s, 0) / Math.max(1, looSigned.length));
+  const looCoverage80Pct = round4(
+    (looSigned.filter((s) => Math.abs(s) <= 1.2816 * looSigma).length / Math.max(1, looSigned.length)) * 100,
+  );
+  return { loo, walkForward, blind, hash, looCoverage80Pct, looPredBySlug };
+}
+
+/**
+ * The age coefficient from a joint Huber-weighted fit of log10(market cap)
+ * on a constant, log10(TVL), bounded growth and log(1 + age in years),
+ * centred at the median age. Returned in log-e units per log-year, so 0.1
+ * means a protocol twice as old (in log years) is worth about 10% more,
+ * all else equal. On the full comps it is near zero; across the
+ * walk-forward folds it swings widely, which is why age is shown on every
+ * row but never priced. A small Gaussian-elimination solve, no dependency.
+ */
+export function jointAgeCoefficient(comps: SnapshotProtocol[]): number {
+  const medG = median(comps.filter((p) => p.change_7d !== null).map((p) => growthLog(p, 0)));
+  const medAge = median(comps.filter((p) => p.listed_at !== null).map((p) => ageYrs(p, 0)));
+  const rows = comps.map((p) => ({
+    y: Math.log10(Math.max(1, p.mcap_usd ?? 1)),
+    x: [1, Math.log10(Math.max(1, p.tvl_usd)), (growthLog(p, medG) - medG) / Math.LN10, Math.log(1 + ageYrs(p, medAge)) - Math.log(1 + medAge)],
+  }));
+  let w = rows.map(() => 1);
+  let beta = [0, 0, 0, 0];
+  const solve = (x: number[][], y: number[], w: number[]): number[] => {
+    const k = x[0]!.length;
+    const a: number[][] = Array.from({ length: k }, () => new Array(k).fill(0));
+    const b = new Array(k).fill(0);
+    for (let i = 0; i < x.length; i++) {
+      for (let r = 0; r < k; r++) {
+        b[r] += w[i]! * x[i]![r]! * y[i]!;
+        for (let c = 0; c < k; c++) a[r]![c]! += w[i]! * x[i]![r]! * x[i]![c]!;
+      }
+    }
+    for (let r = 0; r < k; r++) a[r]![r]! += 1e-9;
+    for (let c = 0; c < k; c++) {
+      let piv = c;
+      for (let r = c + 1; r < k; r++) if (Math.abs(a[r]![c]!) > Math.abs(a[piv]![c]!)) piv = r;
+      [a[c], a[piv]] = [a[piv], a[c]];
+      [b[c], b[piv]] = [b[piv], b[c]];
+      for (let r = c + 1; r < k; r++) {
+        const f = a[r]![c]! / a[c]![c]!;
+        for (let cc = c; cc < k; cc++) a[r]![cc]! -= f * a[c]![cc]!;
+        b[r]! -= f * b[c]!;
+      }
+    }
+    const out = new Array(k).fill(0);
+    for (let r = k - 1; r >= 0; r--) {
+      let s = b[r]!;
+      for (let c = r + 1; c < k; c++) s -= a[r]![c]! * out[c]!;
+      out[r] = s / a[r]![r]!;
+    }
+    return out;
+  };
+  for (let it = 0; it < 5; it++) {
+    beta = solve(rows.map((r) => r.x), rows.map((r) => r.y), w);
+    const res = rows.map((r) => Math.abs(r.y - r.x.reduce((s, v, i) => s + v * beta[i]!, 0)));
+    const sc = Math.max(0.05, 1.4826 * (median(res) || 0.1));
+    w = res.map((r) => Math.min(1, (1.345 * sc) / Math.max(1e-9, r)));
+  }
+  return round4(beta[3]! * Math.LN10);
+}
+
+export interface AblationRow {
+  label: string;
+  loo_gain_pct: number;
+  wf_gain_pct: number;
+  blind_gain_pct: number;
+  hash_gain_pct: number;
+}
+
+/**
+ * What each piece of the model earns, on identical splits: the TVL curve
+ * alone, then growth, then the v2 category multipliers from raw cap/TVL
+ * ratios, then the v3 multipliers from log residuals. Each variant is
+ * refit inside every split, so the gains are out-of-sample, not in-sample.
+ * A piece that earns nothing on any split does not belong in the model.
+ */
+export function ablationTable(comps: SnapshotProtocol[]): AblationRow[] {
+  const variants: { label: string; useGrowth: boolean; useCat: 'none' | 'raw' | 'resid' }[] = [
+    { label: 'TVL curve only', useGrowth: false, useCat: 'none' },
+    { label: '+ growth (0.10)', useGrowth: true, useCat: 'none' },
+    { label: '+ category, raw ratios (v2)', useGrowth: true, useCat: 'raw' },
+    { label: '+ category, log residuals (v3)', useGrowth: true, useCat: 'resid' },
+  ];
+  const dated = comps.filter((p) => p.listed_at !== null).sort((x, y) => (x.listed_at! < y.listed_at! ? -1 : x.listed_at! > y.listed_at! ? 1 : x.slug < y.slug ? -1 : 1));
+  const chunk = Math.floor(dated.length / 4);
+  const cut = Math.floor(dated.length * 0.8);
+  const hashTrain = comps.filter((p) => fnv1a(p.slug) % 5 !== 0);
+  const hashTest = comps.filter((p) => fnv1a(p.slug) % 5 === 0);
+
+  const predictWith = (fit: Fit, medG: number, p: SnapshotProtocol, v: { useGrowth: boolean; useCat: 'none' | 'raw' | 'resid' }): number => {
+    // fitPipeline always computes the residual-based multipliers; for the
+    // raw-ratio variant the caller passes a fit built by rawCatFit below.
+    let logv = fit.a + fit.b * Math.log10(Math.max(1, p.tvl_usd));
+    if (v.useGrowth) logv += (GROWTH_ELASTICITY * (growthLog(p, medG) - medG)) / Math.LN10;
+    const cat = v.useCat === 'none' ? 1 : fit.catMult[p.category ?? 'Other'] ?? 1;
+    return Math.max(1, Math.round(Math.pow(10, logv) * cat));
+  };
+  const rawCatFit = (train: SnapshotProtocol[]): Fit => {
+    const fit = fitPipeline(train);
+    const byCat = new Map<string, number[]>();
+    for (const p of train) {
+      const c = p.category ?? 'Other';
+      const arr = byCat.get(c) ?? [];
+      arr.push((p.mcap_usd ?? 0) / Math.max(1, p.tvl_usd));
+      byCat.set(c, arr);
+    }
+    const globalRatio = median(train.map((p) => (p.mcap_usd ?? 0) / Math.max(1, p.tvl_usd)));
+    const catMult: Record<string, number> = {};
+    for (const [c, ratios] of byCat) {
+      if (ratios.length >= 5) catMult[c] = round4(Math.pow(clip(median(ratios) / globalRatio, 0.25, 2), CAT_SHRINK));
+    }
+    return { ...fit, catMult };
+  };
+  const gainOn = (v: { useGrowth: boolean; useCat: 'none' | 'raw' | 'resid' }, train: SnapshotProtocol[], test: SnapshotProtocol[]): number => {
+    const fit = v.useCat === 'raw' ? rawCatFit(train) : fitPipeline(train);
+    const medG = median(train.filter((p) => p.change_7d !== null).map((p) => growthLog(p, 0)));
+    const flatRatio = median(train.map((p) => (p.mcap_usd ?? 0) / Math.max(1, p.tvl_usd)));
+    const errs: number[] = [];
+    const flatErrs: number[] = [];
+    for (const p of test) {
+      const actual = Math.max(1, p.mcap_usd ?? 1);
+      errs.push(Math.abs(Math.log(predictWith(fit, medG, p, v) / actual)));
+      flatErrs.push(Math.abs(Math.log((flatRatio * p.tvl_usd) / actual)));
+    }
+    const mean = (xs: number[]): number => xs.reduce((t, x) => t + x, 0) / Math.max(1, xs.length);
+    return round4((1 - mean(errs) / Math.max(1e-9, mean(flatErrs))) * 100);
+  };
+  return variants.map((v) => {
+    // LOO: pooled, one refit per held-out comp.
+    const looE: number[] = [];
+    const looF: number[] = [];
+    for (let j = 0; j < comps.length; j++) {
+      const train = comps.filter((_, i) => i !== j);
+      const fit = v.useCat === 'raw' ? rawCatFit(train) : fitPipeline(train);
+      const medG = median(train.filter((p) => p.change_7d !== null).map((p) => growthLog(p, 0)));
+      const flatRatio = median(train.map((p) => (p.mcap_usd ?? 0) / Math.max(1, p.tvl_usd)));
+      const p = comps[j]!;
+      const actual = Math.max(1, p.mcap_usd ?? 1);
+      looE.push(Math.abs(Math.log(predictWith(fit, medG, p, v) / actual)));
+      looF.push(Math.abs(Math.log((flatRatio * p.tvl_usd) / actual)));
+    }
+    const mean = (xs: number[]): number => xs.reduce((t, x) => t + x, 0) / Math.max(1, xs.length);
+    const looGain = round4((1 - mean(looE) / Math.max(1e-9, mean(looF))) * 100);
+    // Walk-forward: pooled over the three folds.
+    const wfE: number[] = [];
+    const wfF: number[] = [];
+    for (let k = 1; k <= 3; k++) {
+      const train = dated.slice(0, k * chunk);
+      const test = dated.slice(k * chunk, (k + 1) * chunk);
+      const fit = v.useCat === 'raw' ? rawCatFit(train) : fitPipeline(train);
+      const medG = median(train.filter((p) => p.change_7d !== null).map((p) => growthLog(p, 0)));
+      const flatRatio = median(train.map((p) => (p.mcap_usd ?? 0) / Math.max(1, p.tvl_usd)));
+      for (const p of test) {
+        const actual = Math.max(1, p.mcap_usd ?? 1);
+        wfE.push(Math.abs(Math.log(predictWith(fit, medG, p, v) / actual)));
+        wfF.push(Math.abs(Math.log((flatRatio * p.tvl_usd) / actual)));
+      }
+    }
+    const wfGain = round4((1 - mean(wfE) / Math.max(1e-9, mean(wfF))) * 100);
+    return {
+      label: v.label,
+      loo_gain_pct: looGain,
+      wf_gain_pct: wfGain,
+      blind_gain_pct: gainOn(v, dated.slice(0, cut), dated.slice(cut)),
+      hash_gain_pct: gainOn(v, hashTrain, hashTest),
+    };
+  });
+}
+
+export interface CatDiag {
+  category: string;
+  n: number;
+  median_miss: number;
+  bias: number;
+}
+
+/** Per-category LOO diagnostics: where the model is trusted, and where the sample is too small to say. */
+export function categoryDiagnostics(comps: SnapshotProtocol[], looPredBySlug: Map<string, number>): CatDiag[] {
+  const byCat = new Map<string, { miss: number[]; signed: number[] }>();
+  for (const p of comps) {
+    const pred = looPredBySlug.get(p.slug);
+    if (pred === undefined) continue;
+    const actual = Math.max(1, p.mcap_usd ?? 1);
+    const c = p.category ?? 'Other';
+    const d = byCat.get(c) ?? { miss: [], signed: [] };
+    d.miss.push(Math.exp(Math.abs(Math.log(pred / actual))));
+    d.signed.push(Math.log(pred / actual));
+    byCat.set(c, d);
+  }
+  return [...byCat.entries()]
+    .filter(([, d]) => d.miss.length >= 5)
+    .map(([category, d]) => ({ category, n: d.miss.length, median_miss: round4(median(d.miss)), bias: round4(Math.exp(median(d.signed))) }))
+    .sort((x, y) => y.n - x.n || (x.category < y.category ? -1 : 1));
 }
 
 // ---------------------------------------------------------------- bootstrap
@@ -548,9 +778,58 @@ function actionFor(p: SnapshotProtocol, deposit: number, chain: string): string 
   return `Deposit ${money(deposit)} of USDC into ${name} on ${chain} and keep the position open.`;
 }
 
-/** Six steps, each an action with its cost and time, derived from the protocol's own record. */
+/** Six steps, each an action with its cost and time, derived from the protocol's own record. Skip rows get a monitor-only plan: no deposit, a stated review date, and the break-even value and chance that would flip the verdict. Farm and thin rows keep the deposit plan, and the verdict step states the break-even distribution chance. */
 export function farmSteps(p: SnapshotProtocol, age: number | null, econ: FarmEconomics): string[] {
   const hold = holdDaysFor(age);
+  const beProb = econ.breakeven_prob_pct;
+  const beVerdict =
+    beProb === null
+      ? `Break-even needs ${money(econ.breakeven_value_usd)} of implied value, which would take above 100% distribution chance, so it is out of reach under the reference scenario.`
+      : `Break-even needs ${money(econ.breakeven_value_usd)} of implied value, about ${beProb.toFixed(0)}% distribution chance.`;
+  const beFlip =
+    beProb === null
+      ? `The verdict flips only if the implied value reaches ${money(econ.breakeven_value_usd)}, which is out of reach under the reference scenario.`
+      : `The verdict flips only if the implied value reaches ${money(econ.breakeven_value_usd)} or the distribution chance rises above ${beProb.toFixed(0)}%.`;
+  if (econ.verdict === 'skip') {
+    const steps: { text: string; cost: string; time: string }[] = [
+      {
+        text: 'Use a fresh wallet that holds only the funds you plan to farm, and keep its seed phrase offline.',
+        cost: 'under $3 of gas for the first transaction',
+        time: '5 minutes',
+      },
+      {
+        text: `Do not deposit into ${p.name}. The expected net is ${econ.net_usd >= 0 ? '+' : ''}${money(econ.net_usd)} over ${FARM_DAYS} days, so watch it instead: check its official site once a month for a points or rewards page.`,
+        cost: '$0 of capital',
+        time: '10 minutes a month',
+      },
+      {
+        text: `Track its TVL and any announced distribution terms. ${beFlip}`,
+        cost: 'no fee to check',
+        time: '10 minutes a month',
+      },
+      {
+        text: `Revisit after ${FARM_DAYS} days, or sooner if the protocol announces a distribution. Until then the money stays out.`,
+        cost: '$0 of capital',
+        time: `${FARM_DAYS} days`,
+      },
+      {
+        text: `Verdict: SKIP. Expected net ${econ.net_usd >= 0 ? '+' : ''}${money(econ.net_usd)} after ${money(econ.econ_cost_usd)} of economic cost over ${FARM_DAYS} days. ${beVerdict}`,
+        cost: `${money(econ.econ_cost_usd)} of economic cost in all if you farmed it`,
+        time: `${FARM_DAYS} days`,
+      },
+      {
+        text: 'Before you withdraw, open the protocol\u2019s own points or rewards page from its official site and claim only from the link it publishes; never pay to claim.',
+        cost: 'no fee to check',
+        time: '10 minutes',
+      },
+    ];
+    return steps.map((s) => {
+      let out = `${s.text} Cost: ${s.cost}. Time: ${s.time}.`;
+      if (out.length > 600) out = `${out.slice(0, 596)}...`;
+      if (out.length < 20) out = `${out} Hold the position and check the protocol's own page.`;
+      return out;
+    });
+  }
   const steps: { text: string; cost: string; time: string }[] = [
     {
       text: 'Use a fresh wallet that holds only the funds you plan to farm, and keep its seed phrase offline.',
@@ -573,7 +852,7 @@ export function farmSteps(p: SnapshotProtocol, age: number | null, econ: FarmEco
       time: `${hold} days`,
     },
     {
-      text: `Verdict: ${econ.verdict.toUpperCase()}. Expected net ${econ.net_usd >= 0 ? '+' : ''}${money(econ.net_usd)} after ${money(econ.econ_cost_usd)} of economic cost over ${FARM_DAYS} days. Break-even needs ${money(econ.breakeven_value_usd)} of implied value${econ.breakeven_prob_pct === null ? ', which is out of reach under the reference scenario' : `, about ${econ.breakeven_prob_pct.toFixed(0)}% distribution chance`}.`,
+      text: `Verdict: ${econ.verdict.toUpperCase()}. Expected net ${econ.net_usd >= 0 ? '+' : ''}${money(econ.net_usd)} after ${money(econ.econ_cost_usd)} of economic cost over ${FARM_DAYS} days. ${beVerdict}`,
       cost: `${money(econ.econ_cost_usd)} of economic cost in all`,
       time: `${FARM_DAYS} days`,
     },
@@ -620,6 +899,7 @@ export interface BoardRow {
   ev_usd: number;
   net_usd: number;
   breakeven_value_usd: number;
+  breakeven_prob_pct: number | null;
   verdict: 'farm' | 'thin' | 'skip';
   farm_steps: string[];
   nearest_comps: { slug: string; tvl_usd: number; mcap_usd: number | null }[];
@@ -648,11 +928,15 @@ export interface RadarData {
     cat_mult: Record<string, number>;
     comps: number;
     excluded: { cex: number; ratio: number; nonpositive: number };
+    age_coef_loge: number;
   };
   audit: { protocols: number; pre_token: number; rankable: number; set_aside: number; watchlist: number };
-  validation: { loo: TestResult; walk_forward: TestResult; blind: TestResult };
+  validation: { loo: TestResult; walk_forward: TestResult; blind: TestResult; hash: TestResult };
+  loo_coverage80_pct: number;
+  ablation: AblationRow[];
+  cat_diag: CatDiag[];
   scale: { tvl: number; value: number; p10: number; p90: number }[];
-  comps: { slug: string; tvl_usd: number; mcap_usd: number; fitted_usd: number; blind: boolean }[];
+  comps: { slug: string; tvl_usd: number; mcap_usd: number; fitted_usd: number; blind: boolean; resid_log10: number }[];
   rows: BoardRow[];
   live: LiveRow[];
   set_aside: { slug: string; name: string; category: string | null; reason: string }[];
@@ -730,6 +1014,7 @@ export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: Rada
         ev_usd: econ.ev_usd,
         net_usd: econ.net_usd,
         breakeven_value_usd: econ.breakeven_value_usd,
+        breakeven_prob_pct: econ.breakeven_prob_pct,
         verdict: econ.verdict,
         farm_steps: farmSteps(p, age, econ),
         nearest_comps: nearestComps(p, comps, fit),
@@ -742,17 +1027,22 @@ export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: Rada
     .slice(0, 24)
     .map((p) => ({ slug: p.slug, name: p.name, category: p.category, chains: p.chains, tvl_usd: p.tvl_usd, mcap_usd: p.mcap_usd, change_7d: p.change_7d }));
 
-  // The comps scatter: every fitted anchor, its fitted value, and whether it
-  // sat in the blind newest-20% holdout.
+  // The comps scatter: every fitted anchor, its fitted value, its log
+  // residual against the fitted curve, and whether it sat in the blind
+  // newest-20% holdout.
   const dated = comps.filter((p) => p.listed_at !== null).sort((x, y) => (x.listed_at! < y.listed_at! ? -1 : x.listed_at! > y.listed_at! ? 1 : x.slug < y.slug ? -1 : 1));
   const blindSet = new Set(dated.slice(Math.floor(dated.length * 0.8)).map((p) => p.slug));
-  const compPoints = comps.map((p) => ({
-    slug: p.slug,
-    tvl_usd: p.tvl_usd,
-    mcap_usd: p.mcap_usd ?? 0,
-    fitted_usd: predictValue(fit, p).value,
-    blind: blindSet.has(p.slug),
-  }));
+  const compPoints = comps.map((p) => {
+    const fitted = predictValue(fit, p).value;
+    return {
+      slug: p.slug,
+      tvl_usd: p.tvl_usd,
+      mcap_usd: p.mcap_usd ?? 0,
+      fitted_usd: fitted,
+      blind: blindSet.has(p.slug),
+      resid_log10: round4(Math.log10(Math.max(1, p.mcap_usd ?? 1) / Math.max(1, fitted))),
+    };
+  });
 
   const radar: RadarData = {
     as_of: snapshot.as_of,
@@ -767,6 +1057,7 @@ export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: Rada
       cat_mult: fit.catMult,
       comps: comps.length,
       excluded,
+      age_coef_loge: jointAgeCoefficient(comps),
     },
     audit: {
       protocols: snapshot.protocols.length,
@@ -775,7 +1066,10 @@ export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: Rada
       set_aside: setAside.length,
       watchlist: snapshot.watchlist.length,
     },
-    validation: { loo: validation.loo, walk_forward: validation.walkForward, blind: validation.blind },
+    validation: { loo: validation.loo, walk_forward: validation.walkForward, blind: validation.blind, hash: validation.hash },
+    loo_coverage80_pct: validation.looCoverage80Pct,
+    ablation: ablationTable(comps),
+    cat_diag: categoryDiagnostics(comps, validation.looPredBySlug),
     scale: curveBand(comps),
     comps: compPoints,
     rows,

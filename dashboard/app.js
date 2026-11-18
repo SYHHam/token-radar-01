@@ -83,6 +83,30 @@
       + '<div class="legend"><i style="background:#2dd4bf"></i>traded comp <i style="background:#f5b544"></i>blind holdout (newest 20%), line: fitted curve, band: bootstrap P10 to P90</div>';
   }
 
+  function residPlot() {
+    var W = 560, H = 260, L = 46, R = 10, T = 12, B = 30;
+    var x0 = 6, x1 = 10, y0 = -2.5, y1 = 2.5;
+    function X(v) { return L + ((Math.log10(Math.max(1e6, Math.min(1e10, v))) - x0) / (x1 - x0)) * (W - L - R); }
+    function Y(v) { return T + (1 - (Math.max(y0, Math.min(y1, v)) - y0) / (y1 - y0)) * (H - T - B); }
+    var pts = D.comps.map(function (c) {
+      return '<circle cx="' + X(c.tvl_usd).toFixed(1) + '" cy="' + Y(c.resid_log10).toFixed(1) + '" r="' + (c.blind ? 4.5 : 3) + '" fill="' + (c.blind ? '#f5b544' : '#2dd4bf') + '" opacity="0.85"><title>' + esc(c.slug) + ': residual ' + c.resid_log10 + ' in log10</title></circle>';
+    }).join('');
+    var grid = '';
+    for (var gx = 6; gx <= 10; gx++) {
+      grid += '<line x1="' + X(Math.pow(10, gx)).toFixed(1) + '" y1="' + T + '" x2="' + X(Math.pow(10, gx)).toFixed(1) + '" y2="' + (H - B) + '" stroke="#1e3352" stroke-width="1"/>';
+      grid += '<text x="' + X(Math.pow(10, gx)).toFixed(1) + '" y="' + (H - 10) + '" fill="#64748b" font-size="10" text-anchor="middle">$' + (gx === 6 ? '1M' : gx === 7 ? '10M' : gx === 8 ? '100M' : gx === 9 ? '1B' : '10B') + '</text>';
+    }
+    for (var gy = -2; gy <= 2; gy++) {
+      grid += '<line x1="' + L + '" y1="' + Y(gy).toFixed(1) + '" x2="' + (W - R) + '" y2="' + Y(gy).toFixed(1) + '" stroke="#1e3352" stroke-width="1"/>';
+      grid += '<text x="' + (L - 5) + '" y="' + (Y(gy) + 3).toFixed(1) + '" fill="#64748b" font-size="10" text-anchor="end">' + (gy > 0 ? '+' : '') + gy + '</text>';
+    }
+    return '<svg class="scatter" viewBox="0 0 ' + W + ' ' + H + '" role="img" aria-label="Comps residuals in log10 against TVL, zero line is exact">'
+      + grid
+      + '<line x1="' + L + '" y1="' + Y(0).toFixed(1) + '" x2="' + (W - R) + '" y2="' + Y(0).toFixed(1) + '" stroke="#e8eef7" stroke-width="1.5"/>'
+      + pts + '</svg>'
+      + '<div class="legend"><i style="background:#2dd4bf"></i>traded comp <i style="background:#f5b544"></i>blind holdout, zero line is exact, 1.0 up means 10 times overvalued by the curve</div>';
+  }
+
   function evidence() {
     var m = D.model, v = D.validation;
     function trow(t) {
@@ -96,14 +120,20 @@
     var scaleRows = D.scale.map(function (s) {
       return '<tr><td class="num">' + usd(s.tvl) + '</td><td class="num">' + usd(s.value) + '</td><td class="num">' + usd(s.p10) + ' to ' + usd(s.p90) + '</td></tr>';
     }).join('');
+    var ablRows = D.ablation.map(function (a) {
+      return '<tr><td>' + esc(a.label) + '</td><td class="num">' + (a.loo_gain_pct >= 0 ? '+' : '') + a.loo_gain_pct.toFixed(1) + '%</td><td class="num">' + (a.wf_gain_pct >= 0 ? '+' : '') + a.wf_gain_pct.toFixed(1) + '%</td><td class="num">' + (a.blind_gain_pct >= 0 ? '+' : '') + a.blind_gain_pct.toFixed(1) + '%</td><td class="num">' + (a.hash_gain_pct >= 0 ? '+' : '') + a.hash_gain_pct.toFixed(1) + '%</td></tr>';
+    }).join('');
+    var diagRows = D.cat_diag.map(function (c) {
+      return '<tr><td>' + esc(c.category) + '</td><td class="num">' + c.n + '</td><td class="num">' + c.median_miss.toFixed(2) + '&times;</td><td class="num">' + c.bias.toFixed(2) + '&times;</td></tr>';
+    }).join('');
     return '<section class="panel"><h2>How implied value is fitted, and tested</h2>'
       + '<div class="evidence"><div>'
       + '<p class="note" style="margin-top:0">The curve is fitted on ' + m.comps + ' traded-token comps: market cap on TVL, Huber-weighted log-log OLS. '
       + 'Left out of the fit: ' + m.excluded.cex + ' exchanges, ' + m.excluded.ratio + ' with cap/TVL outside 0.005 to 20, ' + m.excluded.nonpositive + ' with no positive cap or TVL. '
-      + 'Growth enters as one bounded adjustment. Category multipliers come from each category\u2019s median cap/TVL among comps, pulled halfway toward 1, because each median rests on as few as 5 comps. '
-      + 'Age is not in the model. Version 1 charged young protocols for being young, and the blind test caught it: the newest comps are young but their ratios run no lower, so the age factor is out. The age of each protocol is still shown on its row.</p>'
+      + 'Growth enters as one bounded adjustment. Category multipliers come from each category\u2019s median log residual after the TVL curve, pulled halfway toward 1, because each median rests on as few as 5 comps. '
+      + 'Age is not in the model. A joint fit puts its coefficient at ' + m.age_coef_loge + ' (log-e per log-year, near zero, and it swings widely across folds), and version 1\u2019s age factor cost 2 points on walk-forward and 4 on the blind test. The age of each protocol is still shown on its row.</p>'
       + '<div class="formula">log10(market cap) = ' + m.a + ' + ' + m.b + ' &times; log10(TVL)<br>'
-      + 'implied = curve(TVL) &times; exp(' + m.growth_elasticity + ' &middot; growth) &times; category (shrunk, exponent ' + m.cat_shrink + ')<br>'
+      + 'implied = curve(TVL) &times; exp(' + m.growth_elasticity + ' &middot; growth) &times; category (log-residual, shrunk, exponent ' + m.cat_shrink + ')<br>'
       + 'Doubling TVL multiplies fitted value by 2<sup>' + m.b + '</sup> = ' + Math.pow(2, m.b).toFixed(2) + '&times;.</div>'
       + '<h3>Fitted value at each size (median growth, average category)</h3>'
       + '<table class="plain"><thead><tr><th class="num">TVL</th><th class="num">Fitted value</th><th class="num">P10 to P90 (200 refits)</th></tr></thead><tbody>' + scaleRows + '</tbody></table>'
@@ -111,11 +141,20 @@
       + '</div><div>' + scatter() + '</div></div>'
       + '<h3>Out-of-sample validation: median miss, model against a flat cap/TVL multiple</h3>'
       + '<table><thead><tr><th>Test</th><th class="num">Train to test</th><th class="num">Model median miss</th><th class="num">Flat median miss</th><th class="num">P90 miss</th><th class="num">Log-error gain</th><th class="num">Bias</th></tr></thead><tbody>'
-      + trow(v.walk_forward) + trow(v.loo) + trow(v.blind)
+      + trow(v.walk_forward) + trow(v.loo) + trow(v.blind) + trow(v.hash)
       + '</tbody></table>'
       + '<p class="note">Miss is how many times the prediction is off, in either direction (1.00&times; is exact). '
       + 'The snapshot carries no token-launch dates, so the walk-forward and blind tests order comps by protocol listing date. '
-      + 'They measure how the model generalises across listing cohorts. They are not a historical backtest. No protocol name is ever special-cased.</p>'
+      + 'They measure how the model generalises across listing cohorts. They are not a historical backtest. The hash holdout is a fixed fifth of comps by slug hash. '
+      + 'The leave-one-out 80% interval covers ' + D.loo_coverage80_pct.toFixed(1) + '% of comps, against 80% nominal. No protocol name is ever special-cased.</p>'
+      + '<h3>What each part of the model earns (log-error gain, same splits, refit inside each)</h3>'
+      + '<table><thead><tr><th>Model</th><th class="num">Leave-one-out</th><th class="num">Walk-forward</th><th class="num">Blind</th><th class="num">Hash</th></tr></thead><tbody>' + ablRows + '</tbody></table>'
+      + '<p class="note">Categories earn their keep on leave-one-out (112 comps) and the hash holdout, and cost a little on the blind split, which holds only 17 comps. Residual-based categories beat raw-ratio categories on every split. The curve alone is the baseline everything else has to beat.</p>'
+      + '<div class="evidence"><div><h3>Residuals: what the curve misses, by size</h3>' + residPlot()
+      + '<p class="note">The widest misses are versioned comps: Aave V2 carries the whole AAVE market cap against one version\u2019s TVL, so it sits far above the curve. The Huber fit downweights those points instead of chasing them.</p></div>'
+      + '<div><h3>Where the model is trusted, by category (leave-one-out)</h3>'
+      + '<table class="plain"><thead><tr><th>Category</th><th class="num">Comps</th><th class="num">Median miss</th><th class="num">Bias</th></tr></thead><tbody>' + diagRows + '</tbody></table>'
+      + '<p class="note">Bias above 1.00&times; means the model overvalues the category. Lending misses widest and runs high; RWA is the tightest fit. Categories with fewer than 5 comps are not shown: the sample is too small to say.</p></div></div>'
       + '</section>';
   }
 
@@ -134,6 +173,19 @@
       + '</div>'
       + '<p class="note">Value is not farmability. The largest launches draw the most farmers, so a deposit there splits a small reward many ways. The farmable rows sit below the $50M floor. Each row shows its deposit, its cost over 90 days, its expected net and its break-even, so read the verdict alongside the rank. '
       + 'Implied value is the model\u2019s claim from ' + esc(srcText()) + '. The snapshot records no token for these protocols; that is not proof they have none.</p>';
+  }
+
+  function watchlistGlance() {
+    var wl = D.rows.filter(function (r) { return r.tier === 'watchlist'; }).slice(0, 5);
+    var body = wl.map(function (r) {
+      return '<tr><td class="num"><b>' + r.rank + '</b></td><td><b>' + esc(r.name) + '</b><br><span class="small">' + esc(r.category || 'Other') + '</span></td>'
+        + '<td class="num">' + usd(r.implied_value_usd) + '<br><span class="small">' + usd(r.p10_value_usd) + ' to ' + usd(r.p90_value_usd) + '</span></td>'
+        + '<td class="num ' + (r.net_usd >= 0 ? 'pos' : 'neg') + '">' + money(r.net_usd) + '</td>'
+        + '<td><span class="badge ' + r.verdict + '">' + r.verdict.toUpperCase() + '</span></td></tr>';
+    }).join('');
+    return '<section class="panel"><h2>The watchlist at a glance</h2>'
+      + '<p class="note" style="margin-top:0">The 40 protocols on the watchlist are the radar\u2019s subject. These are the five largest by implied value; the full board below ranks all 198 launch candidates, watchlist and below the floor together.</p>'
+      + '<table class="plain"><thead><tr><th class="num">Rank</th><th>Protocol</th><th class="num">Implied value</th><th class="num">Net 90d</th><th>Verdict</th></tr></thead><tbody>' + body + '</tbody></table></section>';
   }
 
   function farmEvidence() {
@@ -296,25 +348,32 @@
       + '<tr><td>Category multiplier</td><td class="num">&times;' + r.model.cat_mult + '</td></tr>'
       + '<tr><td><b>Implied value</b></td><td class="num"><b>' + usdFull(r.implied_value_usd) + '</b></td></tr>'
       + '</tbody></table>'
+      + '<p class="note">The category multiplier comes from that category\u2019s median log residual after the TVL curve, not from a raw cap/TVL ratio. Age (' + age(r.age_days) + ' with no token) is shown, not priced: the joint fit puts its coefficient at ' + D.model.age_coef_loge + ', near zero.</p>'
       + '<h3>Nearest traded comps</h3>'
       + '<table class="plain"><thead><tr><th>Comp</th><th class="num">TVL</th><th class="num">Market cap</th></tr></thead><tbody>' + near + '</tbody></table>'
       + '<h3>Farm economics, 90 days, reference scenario</h3>'
       + '<p class="note">Deposit ' + usd(r.deposit_usd) + ' on ' + esc(r.chain || 'its cheapest chain') + '. Reference scenario: 30% chance of a distribution, 5% of implied value shared over about ' + F.toLocaleString('en-US') + ' farmers (TVL over a $10,000 average position). Costs exclude smart-contract and principal-loss risk.</p>'
       + '<table class="plain"><tbody>'
-      + '<tr><td>Gas (8 transactions, cheapest chain)</td><td class="num">' + usd(r.cash_cost_usd) + ' cash cost in all</td></tr>'
+      + '<tr><td>Cash cost (gas for 8 transactions + spread)</td><td class="num">' + usd(r.cash_cost_usd) + '</td></tr>'
       + '<tr><td>Economic cost (cash + opportunity + ' + r.hours + 'h at $15/h)</td><td class="num">' + usd(r.econ_cost_usd) + '</td></tr>'
       + '<tr><td>Expected reward (probability-adjusted)</td><td class="num">' + usd(r.ev_usd) + '</td></tr>'
       + '<tr><td><b>Expected net</b></td><td class="num ' + (r.net_usd >= 0 ? 'pos' : 'neg') + '"><b>' + money(r.net_usd) + '</b></td></tr>'
       + '<tr><td>Break-even implied value</td><td class="num">' + usd(r.breakeven_value_usd) + '</td></tr>'
+      + '<tr><td>Break-even distribution chance</td><td class="num">' + (r.breakeven_prob_pct === null ? 'above 100%, out of reach' : 'about ' + r.breakeven_prob_pct.toFixed(0) + '%') + '</td></tr>'
       + '<tr><td>Net at P10 / median / P90 value</td><td class="num">' + money(s10.net) + ' / ' + money(s50.net) + ' / ' + money(s90.net) + '</td></tr>'
       + '</tbody></table>'
+      + '<h3>Net if the distribution chance changes (5% share, same farmers)</h3>'
+      + '<table class="plain"><thead><tr><th>Distribution chance</th><th class="num">Expected reward</th><th class="num">Net</th></tr></thead><tbody>'
+      + [10, 30, 50].map(function (pc) { var ev = (pc / 100) * 0.05 * r.implied_value_usd / Math.max(1, F); return '<tr><td>' + pc + '%</td><td class="num">' + usd(ev) + '</td><td class="num ' + ((ev - r.econ_cost_usd) >= 0 ? 'pos' : 'neg') + '">' + money(ev - r.econ_cost_usd) + '</td></tr>'; }).join('')
+      + '</tbody></table>'
+      + '<p class="note">The verdict follows the 30% row. At 10% the reward barely covers gas; at 50% it still has to clear the same ' + usd(r.econ_cost_usd) + ' of economic cost. The farmer count (' + F.toLocaleString('en-US') + ') is TVL over a $10,000 average position, so more farmers than that shrinks every row here.</p>'
       + '<h3>Farm plan</h3><ol class="steps">' + steps + '</ol>'
       + '<p class="note">These numbers come from the model. No campaign or points program is claimed unless the protocol publishes one. Check the official links and current terms first.</p>'
       + '</div>';
   }
 
   function render() {
-    var html = '<div class="wrap">' + header() + evidence() + farmEvidence() + controls();
+    var html = '<div class="wrap">' + header() + watchlistGlance() + evidence() + farmEvidence() + controls();
     html += state.tab === 'board' ? boardTable() : state.tab === 'live' ? liveTable() : setAsideTable();
     html += '<footer>Token Radar, model ' + esc(D.model_version) + ' &middot; snapshot ' + esc(D.as_of) + ' &middot; implied values are the model\u2019s claim. Farm verdicts rest on the stated reference scenario.</footer></div>';
     html += '<div class="detail" id="detail" role="dialog" aria-modal="true"></div>';

@@ -83,7 +83,7 @@ const verdicts = { farm: 0, thin: 0, skip: 0 };
 for (const r of board) verdicts[r.verdict]++;
 process.stdout.write(
   `token radar: ${snapshot.protocols.length} protocols, ${radar.audit.pre_token} pre-token, ${radar.audit.watchlist} on the watchlist, ${board.length} rows ranked (${radar.audit.set_aside} set aside, ${radar.model.comps} traded comps)\n` +
-    `token radar: validation LOO ${radar.validation.loo.model_median_miss}x, walk-forward ${radar.validation.walk_forward.model_median_miss}x, blind ${radar.validation.blind.model_median_miss}x (flat: ${radar.validation.loo.flat_median_miss}x / ${radar.validation.walk_forward.flat_median_miss}x / ${radar.validation.blind.flat_median_miss}x)\n` +
+    `token radar: validation LOO ${radar.validation.loo.model_median_miss}x, walk-forward ${radar.validation.walk_forward.model_median_miss}x, blind ${radar.validation.blind.model_median_miss}x, hash ${radar.validation.hash.model_median_miss}x (flat: ${radar.validation.loo.flat_median_miss}x / ${radar.validation.walk_forward.flat_median_miss}x / ${radar.validation.blind.flat_median_miss}x / ${radar.validation.hash.flat_median_miss}x), LOO 80% coverage ${radar.loo_coverage80_pct}%\n` +
     `token radar: farm verdicts ${verdicts.farm} farm, ${verdicts.thin} thin, ${verdicts.skip} skip\n` +
     `token radar: wrote ${join(out, 'board.json')}, ${join(out, 'data.js')}, ${join(out, 'dashboard')} (3 files), ${join(out, 'screenshots')} (${shots.length} images) and ${join(out, 'dossier.json')}\n`,
 );
